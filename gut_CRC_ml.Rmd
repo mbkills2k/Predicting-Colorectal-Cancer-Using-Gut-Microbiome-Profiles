@@ -1,0 +1,319 @@
+---
+title: "Predicting Colorectal Cancer Using Gut Microbiome Profiles"
+author: "Mohit Batra"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{=html}
+<style>
+caption {
+  color: black;
+  font-weight: bold;
+  text-align: center;
+  font-size: 16px;
+}
+</style>
+```
+
+# Project Overview
+
+This project aims to develop a machine learning (ML) model capable of predicting disease status (Colorectal Cancer vs. Healthy) based on gut microbiome profiles derived from metagenomic sequencing data. By using microbiome-derived features, we explore how microbial community composition can serve as a biomarker for colorectal cancer (CRC) and contribute to non-invasive diagnostic strategies.
+
+We use a dataset from Feng et al., 2015, one of the earliest large-scale Metagenome-Wide Association Studies (MGWAS) on colorectal cancer. The study provides gut microbial abundance data and clinical metadata for healthy individuals and patients with adenoma or carcinoma. Our analysis focuses on distinguishing carcinoma from healthy samples using gut microbial gene family profiles.
+
+# Environmental Setup
+
+To begin the analysis, we load all the required R packages. These will handle everything from data wrangling to machine learning and plotting. We also set a random seed to ensure reproducibility of results.
+
+```{r library_import, message=FALSE, warning=FALSE}
+
+# Load required libraries
+suppressPackageStartupMessages({
+  library(tidyverse)        # For data manipulation and visualization
+  library(readr)            # Efficient reading of CSV files
+  library(caret)            # Machine learning framework and cross-validation
+  library(randomForest)     # Random Forest classifier
+  library(pROC)             # ROC curve and AUC calculation
+  library(ggplot2)          # Core plotting system
+  library(cowplot)          # For combining ggplot2 plots
+  library(RColorBrewer)     # Color palettes
+  library(reshape2)         # Data reshaping
+  library(corrplot)         # Correlation plots
+  library(here)             # For directory management
+  library(compositions)       # For CLR transformation
+})
+```
+
+We now set the random seed to make sure our results are reproducible, especially the machine learning parts.
+
+```{r}
+set.seed(42)
+```
+
+Next, we define our working directory structure. This keeps things clean and modular. If the necessary folders don’t exist (such as the folder for saving plots), they are created automatically.
+
+```{r}
+# Define project paths
+project_dir <- here::here()
+data_dir <- file.path(project_dir, "data")
+results_dir <- file.path(project_dir, "results")
+figures_dir <- file.path(results_dir, "figures")
+
+# Create results/figures directory if it doesn't exist
+if (!dir.exists(figures_dir)) {
+  dir.create(figures_dir, recursive = TRUE)
+}
+```
+
+We now load the processed count matrix and metadata file. These were previously saved as CSV files. We use `readr::read_csv()` for efficient and clean parsing.
+
+```{r data_load, warning=FALSE, message=FALSE}
+# Load count and metadata tables
+counts <- read.csv(file.path(data_dir, "counts.csv"), header = T,row.names = 1)
+metadata <- read_csv(file.path(data_dir, "metadata.csv"))
+```
+
+```{r}
+head(metadata)
+head(counts)[1:5,1:5]
+```
+# Data Preprocessing
+
+In this step, we ensure that the count matrix and metadata are aligned and ready for downstream machine learning. We clean the data, match sample IDs, and transform the count matrix for classification.
+
+We'll first ensure that both metadata and count tables have consistent sample identifiers. We also set sample IDs as row names for easy alignment.
+
+```{r}
+# Set sample IDs as row names
+metadata <- metadata %>% column_to_rownames(var = "subject_id")
+```
+
+```{r}
+# Transpose the count matrix to have samples as rows
+counts_t <- as.data.frame(t(counts))
+
+# Filter out taxa with low prevalence across samples
+prevalence_threshold <- 0.1  # keep taxa present in at least 10% of samples
+keep_taxa <- colSums(counts_t > 0) > (nrow(counts_t) * prevalence_threshold)
+counts_filtered <- counts_t[, keep_taxa]
+
+# Add pseudocount to avoid log(0) issues
+counts_filtered <- counts_filtered + 1
+
+# Perform CLR transformation
+clr_counts <- as.data.frame(clr(counts_filtered))
+
+# Sanity check: match sample IDs with metadata
+clr_counts$sample_id <- rownames(clr_counts)
+metadata$sample_id <- rownames(metadata)
+
+# Merge metadata and CLR-transformed counts
+merged_data <- inner_join(metadata[,c("study_condition", "sample_id")], clr_counts, by = "sample_id")
+
+# Filter out adenoma samples from metadata and counts
+filtered_data <- merged_data %>%
+  filter(study_condition %in% c("control", "CRC"))
+
+# Final prep for ML
+X <- filtered_data %>% select(-sample_id, -study_condition)
+y <- as.factor(filtered_data$study_condition)
+```
+
+# Data Partitioning & Model Training & Evaluation
+
+We split the data into 80% training and 20% test sets, apply cross-validation on the training set, and evaluate final performance on the independent test set. This gives a more reliable estimate of how well the model generalizes.
+
+
+```{r}
+set.seed(42)
+train_idx <- caret::createDataPartition(y, p = 0.8, list = FALSE)
+
+X_train <- X[train_idx, ]
+X_test  <- X[-train_idx, ]
+y_train <- y[train_idx]
+y_test  <- y[-train_idx]
+```
+
+```{r}
+# cross-validation strategy with 5 folds
+ctrl <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  verboseIter = FALSE
+)
+
+# Train the Random Forest model
+rf_model <- caret::train(
+  x = X_train,
+  y = y_train,
+  method = "rf",
+  trControl = ctrl,
+  metric = "ROC",
+  importance = TRUE
+)
+```
+
+```{r}
+set.seed(42)
+# Predict class probabilities and labels on the test set
+pred_probs <- predict(rf_model, X_test, type = "prob")
+pred_class <- predict(rf_model, X_test)
+
+# Confusion Matrix
+conf_matrix <- confusionMatrix(pred_class, y_test)
+print(conf_matrix)
+
+# ROC Curve and AUC
+roc_obj <- roc(response = y_test, predictor = pred_probs[, "CRC"])  # Adjust label if needed
+auc_val <- auc(roc_obj)
+
+# Plot ROC Curve
+plot(roc_obj, main = paste("ROC Curve (AUC =", round(auc_val, 3), ")"))
+
+```
+## Initial Results Interpretation
+
+We trained a Random Forest classifier to predict disease status (healthy vs carcinoma) based solely on CLR-transformed gut microbiome taxonomic profiles. The model achieved an AUC of 0.796, indicating a moderate ability to distinguish between the two conditions based on microbial composition alone.
+
+The ROC curve (above) demonstrates a clear separation from the no-skill classifier (diagonal line), suggesting that microbiome profiles encode meaningful biological signals relevant to colorectal cancer status. However, the performance is not optimal and leaves room for further improvement.
+
+Several factors may limit this model’s accuracy:
+
+- High dimensionality of microbial features vs. sample size
+
+- Class imbalance (after removing adenoma samples)
+
+- Lack of additional clinical covariates (e.g., diet, age)
+
+These results support the feasibility of microbiome-based classification, but also justify a subsequent model tuning phase to enhance robustness and predictive accuracy.
+
+# Model Optimization
+
+To improve classification performance, we now perform hyperparameter tuning on the Random Forest model. Specifically, we tune the `mtry` parameter, which controls the number of features randomly selected at each split in the trees.
+
+We use 10-fold cross-validation to estimate model performance during tuning.
+
+## Prepare for training
+
+```{r}
+# Define training control
+train_control <- caret::trainControl(
+  method = "cv",         # Cross-validation
+  number = 10,           # Number of folds
+  classProbs = TRUE,     # Needed for AUC
+  summaryFunction = twoClassSummary,  # Use AUC for model evaluation
+  savePredictions = TRUE
+)
+
+# Recode y_train as "Healthy" vs "Cancer" (caret prefers string labels)
+y_train_binary <- factor(ifelse(y_train == "control", "Healthy", "Cancer"))
+
+# Combine features and labels into one training set
+training_data <- cbind(y_train_binary, X_train)
+colnames(training_data)[1] <- "Condition"
+
+```
+
+## Train the tuned model
+```{r}
+# Train the model with tuning
+set.seed(42)
+rf_tuned <- caret::train(
+  Condition ~ ., 
+  data = training_data,
+  method = "rf",
+  metric = "ROC",                  # Optimize for AUC
+  trControl = train_control,
+  tuneGrid = expand.grid(mtry = c(1, 2, 3, 5, 10))  # Try different mtry values
+)
+```
+
+```{r}
+# Print best model info
+print(rf_tuned)
+plot(rf_tuned)
+```
+
+```{r}
+# Predict probabilities on the test set
+x_test_matrix <- X_test  # make sure it's in same format
+rf_probs <- predict(rf_tuned, newdata = x_test_matrix, type = "prob")
+
+# Recode test labels to match training (Healthy/Cancer)
+y_test_binary <- factor(ifelse(y_test == "control", "Healthy", "Cancer"))
+
+# Generate ROC curve
+rf_roc <- roc(response = y_test_binary, predictor = rf_probs$Cancer)
+
+# Plot ROC
+plot(rf_roc, main = paste("Optimized ROC Curve (AUC =", round(auc(rf_roc), 3), ")"))
+```
+
+## Tuned Model Interpretation
+
+The optimized Random Forest model achieved an AUC of **0.815**, demonstrating a solid capacity to distinguish between colorectal cancer (CRC) patients and healthy individuals based solely on their gut microbiome profiles. This improvement from the initial model (AUC = 0.796) ***highlights the effectiveness of tuning*** in enhancing classification performance. The ROC curve reflects a favorable balance between sensitivity and specificity, suggesting that the microbial community structure carries informative signals relevant to CRC status. This performance is particularly notable given the high-dimensional and sparse nature of microbiome data, indicating that disease-associated microbial signatures are indeed detectable. While this model is not intended for clinical deployment, it provides strong evidence supporting the hypothesis that gut microbial alterations accompany CRC and may play a role in its etiology or progression. These findings pave the way for deeper investigation into the most predictive taxa, which may yield both diagnostic biomarkers and mechanistic insights into host–microbiome interactions in colorectal carcinogenesis.
+
+## Future Importance
+
+Let’s extract and visualize the top features (taxa) that contributed most to the classification:
+
+```{r}
+# Extract variable importance
+importance_vals <- varImp(rf_tuned)$importance
+importance_vals$Taxon <- rownames(importance_vals)
+```
+
+
+We need a function to clean the taxa names:
+```{r}
+clean_taxa_names <- function(taxa_names, keep_uniref = FALSE) {
+  cleaned <- gsub(".*\\|g__", "", taxa_names)                          # Remove prefix up to genus
+  cleaned <- gsub("s__", "", cleaned)                                 # Remove species label
+  cleaned <- gsub("`", "", cleaned)                                   # Remove backticks
+  cleaned <- gsub("_", " ", cleaned)                                  # Replace underscores with spaces
+  cleaned <- trimws(cleaned)                                          # Trim whitespace
+  
+  # Optionally keep UniRef ID for traceability
+  if (keep_uniref) {
+    ids <- sub("\\|.*", "", taxa_names)                               # Extract UniRef ID
+    cleaned <- paste0(cleaned, " (", ids, ")")                        # Append ID
+  }
+  
+  return(cleaned)
+}
+```
+
+Let's plot the top 15 taxa based on their importance in our model:
+
+```{r}
+original_names <- importance_vals$Taxon  # or rownames(importance)
+importance_vals$Taxon_clean <- clean_taxa_names(original_names, keep_uniref = FALSE)
+
+# Use Taxon_clean in your ggplot
+ggplot(importance_vals[1:15, ], aes(x = reorder(Taxon_clean, Overall), y = Overall)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 15 Most Important Taxa", x = "Taxon", y = "Importance (Overall)")
+
+```
+
+# Conclusion
+
+In this project, we developed a machine learning pipeline to classify colorectal cancer (CRC) status based on gut microbiome composition using metagenomic data from the FengQ_2015 study. Leveraging CLR-transformed microbial count data, we implemented and optimized a Random Forest classifier to distinguish colorectal cancer patients from healthy controls.
+
+The initial model achieved a moderate AUC of 0.796, which improved to 0.815 after hyperparameter tuning, indicating a meaningful relationship between microbiome composition and disease status.
+
+Feature importance analysis highlighted specific microbial taxa that contributed most significantly to classification performance. Among these, taxa affiliated with the genus Blautia (especially Blautia obeum) and Streptococcus were the most influential. Other important taxa included members of Clostridium, Ruminococcus, and Dorea, several of which have been previously implicated in gut health and CRC pathogenesis. These findings are consistent with previous microbiome studies showing an enrichment or depletion of specific commensals in CRC patients, potentially due to inflammation-driven dysbiosis or altered host–microbe interactions.
+
+This analysis supports the growing body of evidence that the gut microbiome contains predictive signals for colorectal cancer and can serve as a non-invasive biomarker source for early disease screening. However, given the small sample size and class imbalance, these results should be considered preliminary. Future improvements could involve:
+
+- Incorporating functional features (e.g., pathway profiles or gene families)
+
+- Using multi-omics integration
+
+- Benchmarking across multiple classifiers and ensemble models
+
+Additionally, expanding the analysis to include adenoma samples, or integrating dietary and lifestyle metadata, may enhance both interpretability and predictive accuracy in real-world screening applications.
